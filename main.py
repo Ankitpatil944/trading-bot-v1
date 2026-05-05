@@ -161,6 +161,7 @@ class TradingEngine:
             take_profit_pct=cfg.take_profit_pct,
             max_trades_per_day=cfg.max_trades_per_day,
             daily_loss_limit_pct=cfg.daily_loss_limit_pct,
+            lot_size=cfg.lot_size,
         )
 
         # ── Execution ──
@@ -248,17 +249,19 @@ class TradingEngine:
 
     # ── Capital helpers ────────────────────────────────────────────────────
 
-    def _equity_for_risk(self) -> float:
-        live = self.portfolio.equity()
+    def _equity_for_risk(self, include_realized: bool = True) -> float:
         if self.cfg.paper_trading and self.cfg.paper_equity and self.cfg.paper_equity > 0:
-            return float(self.cfg.paper_equity)
-        return live
+            base = float(self.cfg.paper_equity)
+            if include_realized:
+                base += self.journal.session_realized_pnl()
+            return base
+        return self.portfolio.equity()
 
     def _committed_risk_pct(self) -> float:
         with self.portfolio._lock:
             positions = list(self.portfolio._positions.values())
         return PortfolioAllocator.compute_committed_risk_pct(
-            positions, self.stops, self._equity_for_risk()
+            positions, self.stops, self._equity_for_risk(include_realized=True)
         )
 
     # ── Tick handler ───────────────────────────────────────────────────────
@@ -271,7 +274,7 @@ class TradingEngine:
         # Kill switch check on every tick (uses cached equity, no API call)
         if self.cfg.kill_switch_loss_pct > 0:
             self.kill_switch.check(
-                current_equity=self.portfolio.equity(),
+                current_equity=self._equity_for_risk(include_realized=True),
                 unrealized_pnl=self.portfolio.unrealized_pnl_total(),
                 as_of=tick.timestamp,
             )
@@ -410,23 +413,47 @@ class TradingEngine:
         session_pnl = self.journal.session_realized_pnl()
         day_pct = self.risk.daily_pnl_pct(risk_eq)
         committed = self._committed_risk_pct()
-        parts = [
-            f"kite_net={eq:,.0f}",
-            f"risk={risk_eq:,.0f}",
-            f"committed={committed:.1f}%",
-            f"unrealized={unreal:+.2f}",
-            f"session_pnl={session_pnl:+.2f}",
-            f"day%={day_pct:.2f}" if day_pct is not None else "",
-            f"trades={self.risk.trades_today()}",
-            f"killed={'YES' if self.kill_switch.is_killed else 'no'}",
-        ]
-        sym_parts = []
+        # --- Color & Formatting Helpers ---
+        C_RESET = "\033[0m"
+        C_BOLD = "\033[1m"
+        C_CYAN = "\033[36m"
+        C_GREEN = "\033[32m"
+        C_RED = "\033[31m"
+        C_YELLOW = "\033[33m"
+        C_MAGENTA = "\033[35m"
+
+        def _clr(val: float, fmt: str = ".2f") -> str:
+            color = C_GREEN if val > 0 else (C_RED if val < 0 else C_RESET)
+            return f"{color}{val:>{fmt}}{C_RESET}"
+
+        # Header
+        print(f"\n{C_CYAN}{'='*80}{C_RESET}")
+        header = (
+            f"{C_BOLD}PORTFOLIO | {C_RESET}"
+            f"Net: {C_BOLD}{eq:,.0f}{C_RESET} | "
+            f"Risk: {risk_eq:,.0f} | "
+            f"PnL: {_clr(session_pnl, ',.2f')} ({_clr(day_pct or 0.0, '.2f')}%) | "
+            f"Trades: {self.risk.trades_today()}"
+        )
+        print(header)
+        
+        # Position Header
+        print(f"{'-'*80}")
+        print(f"{C_BOLD}{'SYMBOL':<10} {'QTY':>6} {'LTP':>10} {'UPNL':>10} {'SL':>10} {'TARGET':>10}{C_RESET}")
+        
         for s in self.cfg.symbols:
-            lp = self.execution.last_prices.get(s)
+            lp = self.execution.last_prices.get(s, 0.0)
             p = self.portfolio.position_for(s)
             q, upnl, sl = (p.quantity, p.unrealized_pnl, self.stops.current_sl(s)) if p else (0, 0.0, None)
-            sym_parts.append(f"{s}[q={q} ltp={lp} upnl={upnl:+.0f} sl={sl}]")
-        print("[dash] " + " | ".join(x for x in parts if x) + "  " + "  ".join(sym_parts), flush=True)
+            
+            # Highlight active positions
+            line_color = C_YELLOW if q != 0 else C_RESET
+            q_str = f"{C_BOLD}{q}{C_RESET}" if q != 0 else "0"
+            sl_str = f"{sl:.2f}" if sl else "-"
+            
+            print(f"{line_color}{s:<10}{C_RESET} {q_str:>6} {lp:>10.2f} {_clr(upnl, '>10.2f')} {sl_str:>10} {'-':>10}")
+        
+        print(f"{C_CYAN}{'='*80}{C_RESET}\n", flush=True)
 
     # ── Candle handler ─────────────────────────────────────────────────────
 
@@ -447,9 +474,9 @@ class TradingEngine:
         sig = self.strategy.evaluate(ctx, snap, htf_snap, htf_close,
                                      current_bar_volume=float(candle.volume))
 
-        self.log.info("bar", extra={"event": "engine", "symbol": symbol,
-                                    "close": candle.close, "signal": sig.name,
-                                    "rsi": snap.rsi, "vwap": snap.vwap})
+        self.log.debug("bar", extra={"event": "engine", "symbol": symbol,
+                                     "close": candle.close, "signal": sig.name,
+                                     "rsi": snap.rsi, "vwap": snap.vwap})
 
         if sig == Signal.BUY:
             # Killed? Block all new entries

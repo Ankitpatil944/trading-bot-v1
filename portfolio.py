@@ -105,7 +105,7 @@ class Portfolio:
             total_eq = self._equity + sum(p.unrealized_pnl for p in mapped.values())
             self._equity_curve.append((datetime.now(), total_eq))
 
-            logger.info(
+            logger.debug(
                 "portfolio_sync",
                 extra={"event": "portfolio", "equity": self._equity,
                        "positions": len(self._positions),

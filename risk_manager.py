@@ -40,6 +40,7 @@ class RiskManager:
     take_profit_pct: Optional[float]
     max_trades_per_day: int
     daily_loss_limit_pct: float
+    lot_size: int = 1
 
     _day: Optional[date] = field(default=None, repr=False)
     _trades_today: int = field(default=0, repr=False)
@@ -100,8 +101,11 @@ class RiskManager:
             return RiskDecision(False, reason="invalid_stop_distance")
 
         qty = int(risk_amount // stop_dist)
-        if qty < 1:
-            return RiskDecision(False, reason="qty_below_minimum")
+        if self.lot_size > 1:
+            qty = (qty // self.lot_size) * self.lot_size
+
+        if qty < self.lot_size:
+            return RiskDecision(False, reason="qty_below_minimum_lot")
 
         sl = entry_price - stop_dist
         tp: Optional[float] = None

@@ -92,6 +92,7 @@ class AppConfig:
     )
     max_trades_per_day: int = field(default_factory=lambda: _env_int("MAX_TRADES_PER_DAY", 10))
     daily_loss_limit_pct: float = field(default_factory=lambda: _env_float("DAILY_LOSS_LIMIT_PCT", 3.0))
+    lot_size: int = field(default_factory=lambda: _env_int("LOT_SIZE", 1))
 
     # Product / variety for cash equity (CNC delivery, MIS intraday)
     kite_product: str = field(default_factory=lambda: _env("KITE_PRODUCT", "MIS") or "MIS")

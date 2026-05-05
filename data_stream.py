@@ -196,7 +196,7 @@ class KiteDataStream:
         self._reconnect_thread: Optional[threading.Thread] = None
         self._fallback: Optional[PollingFallback] = None
 
-    def _handle_ticks(self, ws_ticks: Iterable[dict]) -> None:
+    def _handle_ticks(self, ws: KiteTicker, ws_ticks: Iterable[dict]) -> None:
         for x in ws_ticks:
             try:
                 token = int(x.get("instrument_token", 0))
@@ -254,6 +254,12 @@ class KiteDataStream:
                 self._kws.on_close = self._on_ws_close
                 self._ws_connected.clear()
                 self._kws.connect(threaded=True)
+                # Give it a few seconds to establish the initial connection
+                for _ in range(20):
+                    if self._ws_connected.is_set() or self._stop.is_set():
+                        break
+                    time.sleep(0.5)
+
                 while not self._stop.is_set() and self._ws_connected.is_set():
                     time.sleep(0.5)
             except Exception as exc:  # noqa: BLE001

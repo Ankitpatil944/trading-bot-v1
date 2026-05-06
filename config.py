@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -62,6 +63,42 @@ class AppConfig:
             else ["INFY", "RELIANCE"]
         )
     )
+
+    # Options Trading
+    options_mode: bool = field(default_factory=lambda: _env_bool("OPTIONS_MODE", False))
+    spot_symbol: str = field(default_factory=lambda: _env("SPOT_SYMBOL", "NIFTY 50") or "NIFTY 50")
+    options_ce_symbol: str = field(default_factory=lambda: _env("OPTIONS_CE_SYMBOL", "") or "")
+    options_pe_symbol: str = field(default_factory=lambda: _env("OPTIONS_PE_SYMBOL", "") or "")
+    # Premium stop floor (% of option price); widens SL distance so tiny %-stops are not dominated by spread/noise
+    options_min_stop_loss_pct: float = field(
+        default_factory=lambda: _env_float("OPTIONS_MIN_STOP_LOSS_PCT", 12.0)
+    )
+    # Do not use spot ATR for stop distance when true (ATR on spot rarely matches premium path)
+    options_disable_atr_for_risk: bool = field(
+        default_factory=lambda: _env_bool("OPTIONS_DISABLE_ATR_FOR_RISK", True)
+    )
+    # If true, pass spot ATR into risk sizing (only if STOP_LOSS_USE_ATR=true and previous flag allows)
+    options_use_spot_atr_for_sizing: bool = field(
+        default_factory=lambda: _env_bool("OPTIONS_USE_SPOT_ATR_FOR_SIZING", False)
+    )
+    # If false in options_mode, skip the spot volume confirmation on entries (often too strict for index options)
+    options_use_spot_volume_filter: bool = field(
+        default_factory=lambda: _env_bool("OPTIONS_USE_SPOT_VOLUME_FILTER", True)
+    )
+    # If true, allow a one-time "trend entry" when the bot starts mid-trend (EMA fast vs slow alignment),
+    # instead of waiting for the next crossover candle.
+    options_allow_trend_entries: bool = field(
+        default_factory=lambda: _env_bool("OPTIONS_ALLOW_TREND_ENTRIES", True)
+    )
+
+    # Strategy session window (IST); same schedule used for spot/cash-style gating (NFO/BFO daytime)
+    session_start_ist: str = field(default_factory=lambda: _env("SESSION_START_IST", "09:15") or "09:15")
+    session_end_ist: str = field(default_factory=lambda: _env("SESSION_END_IST", "15:30") or "15:30")
+    session_trade_weekends: bool = field(default_factory=lambda: _env_bool("SESSION_TRADE_WEEKENDS", False))
+
+    # Paper: simulated market slippage vs last tick (basis points). Options default wider than cash.
+    slippage_bps: float = field(default_factory=lambda: _env_float("SLIPPAGE_BPS", 2.0))
+    options_slippage_bps: float = field(default_factory=lambda: _env_float("OPTIONS_SLIPPAGE_BPS", 35.0))
 
     # Candle timeframe in minutes (1 or 5 supported by aggregator)
     candle_interval_minutes: int = field(default_factory=lambda: _env_int("CANDLE_INTERVAL_MINUTES", 1))
@@ -174,6 +211,28 @@ class AppConfig:
 
     def __post_init__(self) -> None:
         self.symbols = [s.strip().upper() for s in self.symbols if s.strip()]
+        self.options_ce_symbol = self.options_ce_symbol.strip().upper()
+        self.options_pe_symbol = self.options_pe_symbol.strip().upper()
+        self.spot_symbol = self.spot_symbol.strip()
+        self.session_start_ist = self.session_start_ist.strip()
+        self.session_end_ist = self.session_end_ist.strip()
+        for name, val in (
+            ("SESSION_START_IST", self.session_start_ist),
+            ("SESSION_END_IST", self.session_end_ist),
+        ):
+            try:
+                datetime.strptime(val, "%H:%M")
+            except ValueError as exc:
+                raise ValueError(f"{name} must be HH:MM, got {val!r}") from exc
+
+        if self.options_mode:
+            if not self.options_ce_symbol or not self.options_pe_symbol:
+                raise ValueError("OPTIONS_MODE requires OPTIONS_CE_SYMBOL and OPTIONS_PE_SYMBOL")
+            # Overwrite symbols to ensure we stream data for spot + both options
+            self.symbols = [self.spot_symbol, self.options_ce_symbol, self.options_pe_symbol]
+        else:
+            self.options_min_stop_loss_pct = 0.0
+
         if self.paper_equity is not None and self.paper_equity <= 0:
             self.paper_equity = None
         if self.candle_interval_minutes not in (1, 3, 5, 15, 60):

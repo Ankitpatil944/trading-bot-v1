@@ -316,10 +316,23 @@ def resolve_instruments(
     """Map tradingsymbol -> instrument_token and reverse."""
     instruments = kite.instruments(exchange)
     by_sym = {i["tradingsymbol"]: int(i["instrument_token"]) for i in instruments}
+    
+    # Also fetch NSE to resolve spot indices / equities when primary is derivatives (e.g. NFO).
+    if exchange != "NSE":
+        nse_instruments = kite.instruments("NSE")
+        for i in nse_instruments:
+            if i["tradingsymbol"] not in by_sym:
+                by_sym[i["tradingsymbol"]] = int(i["instrument_token"])
+    # BSE: Sensex spot index (SENSEX) lives here; needed when trading BFO Sensex options.
+    if exchange == "BFO":
+        for i in kite.instruments("BSE"):
+            if i["tradingsymbol"] not in by_sym:
+                by_sym[i["tradingsymbol"]] = int(i["instrument_token"])
+
     out: Dict[str, int] = {}
     for s in symbols:
         if s not in by_sym:
-            raise ValueError(f"Unknown tradingsymbol on {exchange}: {s}")
+            raise ValueError(f"Unknown tradingsymbol on {exchange} (or NSE/BSE): {s}")
         out[s] = by_sym[s]
     rev = {v: k for k, v in out.items()}
     return out, rev

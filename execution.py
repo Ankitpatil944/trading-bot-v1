@@ -147,6 +147,8 @@ class ExecutionService:
         max_retries: int = 5,
         retry_base_seconds: float = 0.5,
         slippage_bps: float = 2.0,
+        options_slippage_bps: Optional[float] = None,
+        options_symbols: Optional[Set[str]] = None,
         on_paper_fill: Optional[Callable[[FillRecord], None]] = None,
     ) -> None:
         self.kite = kite
@@ -158,6 +160,8 @@ class ExecutionService:
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
         self.slippage_bps = slippage_bps
+        self.options_slippage_bps = options_slippage_bps
+        self.options_symbols = {s.upper() for s in options_symbols} if options_symbols else None
         self.on_paper_fill = on_paper_fill
 
         self.last_prices: Dict[str, float] = {}
@@ -185,11 +189,17 @@ class ExecutionService:
         assert last is not None
         raise last
 
+    def _effective_slippage_bps(self, symbol: str) -> float:
+        sym = symbol.upper()
+        if self.options_symbols and sym in self.options_symbols and self.options_slippage_bps is not None:
+            return float(self.options_slippage_bps)
+        return self.slippage_bps
+
     def _slippage_adjusted(self, symbol: str, side: OrderSide) -> float:
         base = float(self.last_prices.get(symbol.upper(), 0.0))
         if base <= 0:
             return 0.0
-        adj = self.slippage_bps / 10_000.0
+        adj = self._effective_slippage_bps(symbol) / 10_000.0
         return base * (1.0 + adj) if side == OrderSide.BUY else base * (1.0 - adj)
 
     # ── Market order ───────────────────────────────────────────────────────

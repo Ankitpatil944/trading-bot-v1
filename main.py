@@ -16,7 +16,7 @@ import logging
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from allocator import PortfolioAllocator, SignalCandidate, score_candidate
 from analytics import TradeAnalytics
@@ -106,6 +106,27 @@ class TradingEngine:
         self.kite = auth.connect(cfg.kite_access_token)
         self.sym_to_tok, self.tok_to_sym = resolve_instruments(self.kite, cfg.exchange, cfg.symbols)
 
+        if cfg.options_mode:
+            self.log.info(
+                "options_mode_active",
+                extra={
+                    "event": "engine",
+                    "spot": cfg.spot_symbol,
+                    "ce": cfg.options_ce_symbol,
+                    "pe": cfg.options_pe_symbol,
+                    "min_stop_pct": cfg.options_min_stop_loss_pct,
+                    "paper_opt_slip_bps": cfg.options_slippage_bps,
+                },
+            )
+            if cfg.stop_loss_use_atr and cfg.options_disable_atr_for_risk:
+                self.log.info(
+                    "options_atr_suppressed",
+                    extra={
+                        "event": "engine",
+                        "msg": "Stop distance uses premium % (and floor); spot ATR not applied to options entries.",
+                    },
+                )
+
         # ── Portfolio ──
         self.portfolio = Portfolio(self.kite, cfg.exchange, cfg.symbols)
         self.portfolio.sync(force=True)
@@ -136,16 +157,24 @@ class TradingEngine:
                                    max(60, cfg.bootstrap_candles // 2), self.htf_indicators[s])
 
         # ── Strategy ──
+        use_vol = cfg.use_volume_filter
+        if cfg.options_mode and not cfg.options_use_spot_volume_filter:
+            use_vol = False
+
         self.strategy = EMACrossoverStrategy(
             rsi_buy_max=cfg.rsi_buy_max,
             rsi_sell_min=cfg.rsi_sell_min,
             use_rsi_filter=True,
             use_vwap_filter=cfg.use_vwap_filter,
-            use_volume_filter=cfg.use_volume_filter,
+            use_volume_filter=use_vol,
             volume_filter_mult=cfg.volume_filter_mult,
             use_htf_trend_filter=cfg.higher_timeframe_minutes > 0,
-            long_only=True,
+            long_only=not cfg.options_mode,
             entry_cutoff_time=cfg.entry_cutoff_time,
+            session_start_ist=cfg.session_start_ist,
+            session_end_ist=cfg.session_end_ist,
+            session_trade_weekends=cfg.session_trade_weekends,
+            allow_trend_entries=(cfg.options_allow_trend_entries if cfg.options_mode else False),
         )
         for s in cfg.symbols:
             ef, es = self.indicators[s].peek_ema()
@@ -162,7 +191,16 @@ class TradingEngine:
             max_trades_per_day=cfg.max_trades_per_day,
             daily_loss_limit_pct=cfg.daily_loss_limit_pct,
             lot_size=cfg.lot_size,
+            options_mode=cfg.options_mode,
+            options_min_stop_loss_pct=cfg.options_min_stop_loss_pct,
+            options_disable_atr_for_risk=cfg.options_disable_atr_for_risk,
         )
+
+        opt_syms: Optional[Set[str]] = None
+        opt_slip: Optional[float] = None
+        if cfg.options_mode:
+            opt_syms = {cfg.options_ce_symbol, cfg.options_pe_symbol}
+            opt_slip = cfg.options_slippage_bps
 
         # ── Execution ──
         self.execution = ExecutionService(
@@ -173,6 +211,9 @@ class TradingEngine:
             paper=cfg.paper_trading,
             max_retries=cfg.api_max_retries,
             retry_base_seconds=cfg.api_retry_base_seconds,
+            slippage_bps=cfg.slippage_bps,
+            options_slippage_bps=opt_slip,
+            options_symbols=opt_syms,
             on_paper_fill=self._on_paper_fill,
         )
 
@@ -466,6 +507,42 @@ class TradingEngine:
         htf_close = self._htf_last.get(symbol)
         pos = self.portfolio.position_for(symbol)
 
+        if self.cfg.options_mode:
+            if symbol != self.cfg.spot_symbol:
+                return  # Strategy only evaluates the spot symbol
+
+            in_pos = self.portfolio.has_open_position(self.cfg.options_ce_symbol) or \
+                     self.portfolio.has_open_position(self.cfg.options_pe_symbol)
+            
+            ctx = StrategyContext(
+                symbol=symbol, candle=candle,
+                in_position=in_pos,
+                position_side=None,
+            )
+            sig = self.strategy.evaluate(ctx, snap, htf_snap, htf_close, current_bar_volume=float(candle.volume))
+
+            self.log.debug(
+                f"spot_bar symbol={symbol} close={candle.close:.2f} signal={sig.name} "
+                f"ema_fast={snap.ema_fast} ema_slow={snap.ema_slow} rsi={snap.rsi} vwap={snap.vwap}",
+                extra={"event": "engine"},
+            )
+
+            if sig == Signal.BUY:
+                if self.portfolio.has_open_position(self.cfg.options_pe_symbol):
+                    self._dispatch_sell(self.cfg.options_pe_symbol)
+                if not self.kill_switch.is_killed:
+                    candidate = SignalCandidate(symbol=self.cfg.options_ce_symbol, signal=Signal.BUY, candle=candle, snap=snap)
+                    self.allocator.submit(candidate)
+
+            elif sig == Signal.SELL:
+                if self.portfolio.has_open_position(self.cfg.options_ce_symbol):
+                    self._dispatch_sell(self.cfg.options_ce_symbol)
+                if not self.kill_switch.is_killed:
+                    candidate = SignalCandidate(symbol=self.cfg.options_pe_symbol, signal=Signal.BUY, candle=candle, snap=snap)
+                    self.allocator.submit(candidate)
+            return
+
+        # Default Cash Equity Mode
         ctx = StrategyContext(
             symbol=symbol, candle=candle,
             in_position=self.portfolio.has_open_position(symbol),
@@ -474,23 +551,22 @@ class TradingEngine:
         sig = self.strategy.evaluate(ctx, snap, htf_snap, htf_close,
                                      current_bar_volume=float(candle.volume))
 
-        self.log.debug("bar", extra={"event": "engine", "symbol": symbol,
-                                     "close": candle.close, "signal": sig.name,
-                                     "rsi": snap.rsi, "vwap": snap.vwap})
+        self.log.debug(
+            f"bar symbol={symbol} close={candle.close:.2f} signal={sig.name} "
+            f"ema_fast={snap.ema_fast} ema_slow={snap.ema_slow} rsi={snap.rsi} vwap={snap.vwap}",
+            extra={"event": "engine"},
+        )
 
         if sig == Signal.BUY:
-            # Killed? Block all new entries
             if self.kill_switch.is_killed:
                 self.log.info("signal_blocked_kill_switch",
                               extra={"event": "kill", "symbol": symbol})
                 return
-            # Submit to allocator for ranked, budget-aware dispatch
             candidate = SignalCandidate(symbol=symbol, signal=sig, candle=candle, snap=snap)
             self.allocator.submit(candidate)
 
         elif sig == Signal.SELL:
-            # Exits bypass the allocator and fire immediately
-            self._dispatch_sell(symbol, candle, snap)
+            self._dispatch_sell(symbol)
 
     # ── Allocator callback (called after 500 ms ranking window) ───────────
 
@@ -510,10 +586,19 @@ class TradingEngine:
             self.log.error("state_inconsistent", extra={"event": "engine", "reason": "equity_zero"})
             return
 
+        # Fetch actual last price of the symbol to buy, not the spot candle's close
+        entry_px = self.execution.last_prices.get(symbol.upper())
+        if not entry_px:
+            entry_px = float(candle.close)  # Fallback
+
+        atr_for_risk: Optional[float] = snap.atr if self.cfg.stop_loss_use_atr else None
+        if self.cfg.options_mode and not self.cfg.options_use_spot_atr_for_sizing:
+            atr_for_risk = None
+
         rd = self.risk.evaluate_new_entry(
             equity=eq,
-            entry_price=float(candle.close),
-            atr=snap.atr if self.cfg.stop_loss_use_atr else None,
+            entry_price=entry_px,
+            atr=atr_for_risk,
             as_of=candle.interval_start,
         )
         if not rd.allowed:
@@ -549,19 +634,23 @@ class TradingEngine:
 
     # ── Sell dispatch ──────────────────────────────────────────────────────
 
-    def _dispatch_sell(self, symbol: str, candle: Candle, snap: IndicatorSnapshot) -> None:
+    def _dispatch_sell(self, symbol: str) -> None:
         if not self.portfolio.has_open_position(symbol):
             return
         eq = self._equity_for_risk()
-        rd_exit = self.risk.evaluate_exit(equity=eq, as_of=candle.interval_start)
+        as_of = datetime.now()
+        rd_exit = self.risk.evaluate_exit(equity=eq, as_of=as_of)
         if not rd_exit.allowed:
             self.log.warning("exit_blocked", extra={"event": "risk", "symbol": symbol,
                                                      "reason": rd_exit.reason})
             return
-        # Journal close first (uses candle close as indicative price; flatten may get different fill)
+            
+        exit_px = self.execution.last_prices.get(symbol.upper(), 0.0)
+        
+        # Journal close first
         self.journal.close_trade(
-            symbol=symbol, exit_price=float(candle.close),
-            exit_time=candle.interval_start, exit_reason="signal-exit", order_id_exit="pending",
+            symbol=symbol, exit_price=exit_px,
+            exit_time=as_of, exit_reason="signal-exit", order_id_exit="pending",
         )
         self._flatten(symbol, tag="signal-exit")
 

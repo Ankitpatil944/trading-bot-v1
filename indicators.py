@@ -7,7 +7,7 @@ Each symbol maintains its own `IndicatorState` updated one closed candle at a ti
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 
 from models import Candle
@@ -62,7 +62,7 @@ class IndicatorState:
 
     _cum_tp_v: float = field(default=0.0, repr=False)
     _cum_v: float = field(default=0.0, repr=False)
-    _vwap_day: Optional[datetime] = field(default=None, repr=False)
+    _vwap_day: Optional[date] = field(default=None, repr=False)
 
     _vol_window: List[float] = field(default_factory=list, repr=False)
     _vol_sma: Optional[float] = field(default=None, repr=False)

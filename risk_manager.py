@@ -31,6 +31,9 @@ class RiskManager:
     Position size = risk_amount / stop_distance
       where risk_amount = equity × risk_per_trade_pct / 100
       and   stop_distance = entry × stop_loss_pct/100  (or ATR × multiplier)
+
+    Options: optional floor on stop distance as % of option premium; ATR from spot can be
+    disabled so sizing/stops use premium %-distance only (see config flags).
     """
 
     risk_per_trade_pct: float
@@ -41,6 +44,9 @@ class RiskManager:
     max_trades_per_day: int
     daily_loss_limit_pct: float
     lot_size: int = 1
+    options_mode: bool = False
+    options_min_stop_loss_pct: float = 0.0
+    options_disable_atr_for_risk: bool = True
 
     _day: Optional[date] = field(default=None, repr=False)
     _trades_today: int = field(default=0, repr=False)
@@ -92,10 +98,25 @@ class RiskManager:
 
         risk_amount = equity * (self.risk_per_trade_pct / 100.0)
 
-        if self.stop_loss_use_atr and atr is not None and atr > 0:
+        use_atr = (
+            self.stop_loss_use_atr
+            and atr is not None
+            and atr > 0
+            and not (self.options_mode and self.options_disable_atr_for_risk)
+        )
+        if use_atr:
             stop_dist = self.stop_loss_atr_mult * atr
         else:
             stop_dist = entry_price * (self.stop_loss_pct / 100.0)
+
+        if self.options_mode and self.options_min_stop_loss_pct > 0:
+            floor = entry_price * (self.options_min_stop_loss_pct / 100.0)
+            if floor > stop_dist:
+                stop_dist = floor
+                logger.debug(
+                    "options_stop_floor_applied",
+                    extra={"event": "risk", "floor_pct": self.options_min_stop_loss_pct, "entry": entry_price},
+                )
 
         if stop_dist <= 0:
             return RiskDecision(False, reason="invalid_stop_distance")
